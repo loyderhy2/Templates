@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/ripio-auth-passive-recon.yml
       - security-research/ripio-auth-passive-recon.sh
+      - security-research/ripio-auth-mfa-chunk.sh
   workflow_dispatch:
 
 permissions:
@@ -24,11 +25,24 @@ jobs:
         env:
           H1_USERNAME: trekmail
         run: bash security-research/ripio-auth-passive-recon.sh
+      - name: Collect referenced public client chunk
+        shell: bash
+        env:
+          H1_USERNAME: trekmail
+        run: bash security-research/ripio-auth-mfa-chunk.sh
       - name: Upload passive recon evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ripio-auth-passive-recon
           path: ripio-auth-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload referenced client chunk
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripio-auth-mfa-chunk
+          path: ripio-auth-mfa-chunk
           if-no-files-found: warn
           retention-days: 7
