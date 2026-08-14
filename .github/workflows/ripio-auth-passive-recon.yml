@@ -9,6 +9,7 @@ on:
       - security-research/ripio-auth-mfa-chunk.sh
       - security-research/ripio-app-passive-recon.sh
       - security-research/ripio-app-startup-chunks.sh
+      - security-research/ripio-app-proof-baseline.sh
   workflow_dispatch:
 
 permissions:
@@ -42,6 +43,11 @@ jobs:
         env:
           H1_USERNAME: trekmail
         run: bash security-research/ripio-app-startup-chunks.sh
+      - name: Collect unauthenticated proof baseline
+        shell: bash
+        env:
+          H1_USERNAME: trekmail
+        run: bash security-research/ripio-app-proof-baseline.sh
       - name: Upload passive auth evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,5 +78,13 @@ jobs:
         with:
           name: ripio-app-startup-chunks
           path: ripio-app-startup-chunks
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload proof baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripio-app-proof-baseline
+          path: ripio-app-proof-baseline
           if-no-files-found: warn
           retention-days: 7
