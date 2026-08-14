@@ -7,6 +7,7 @@ on:
       - .github/workflows/ripio-auth-passive-recon.yml
       - security-research/ripio-auth-passive-recon.sh
       - security-research/ripio-auth-mfa-chunk.sh
+      - security-research/ripio-app-passive-recon.sh
   workflow_dispatch:
 
 permissions:
@@ -16,11 +17,11 @@ jobs:
   recon:
     name: Collect marked public auth artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Run low-impact marked collector
+      - name: Run low-impact marked auth collector
         shell: bash
         env:
           H1_USERNAME: trekmail
@@ -30,7 +31,12 @@ jobs:
         env:
           H1_USERNAME: trekmail
         run: bash security-research/ripio-auth-mfa-chunk.sh
-      - name: Upload passive recon evidence
+      - name: Run low-impact marked app collector
+        shell: bash
+        env:
+          H1_USERNAME: trekmail
+        run: bash security-research/ripio-app-passive-recon.sh
+      - name: Upload passive auth evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -44,5 +50,13 @@ jobs:
         with:
           name: ripio-auth-mfa-chunk
           path: ripio-auth-mfa-chunk
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload passive app evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripio-app-passive-recon
+          path: ripio-app-passive-recon
           if-no-files-found: warn
           retention-days: 7
