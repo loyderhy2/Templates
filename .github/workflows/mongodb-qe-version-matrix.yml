@@ -1,0 +1,136 @@
+name: MongoDB QE authorization affected-version matrix
+
+on:
+  push:
+    branches:
+      - security/mongodb-qe-runtime-20260825
+    paths:
+      - .github/workflows/mongodb-qe-version-matrix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  replica-version:
+    name: MongoDB ${{ matrix.version }} replica
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['8.2.12', '8.0.29']
+    env:
+      MONGODB_VERSION: ${{ matrix.version }}
+      EVIDENCE_DIR: security-research/mongodb-qe/version-evidence/${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install driver and encryption dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install 'pymongo[encryption]==4.17.0'
+          mkdir -p "$EVIDENCE_DIR"
+          python - <<'PY' | tee "$EVIDENCE_DIR/python-dependencies.txt"
+          import pymongo, pymongocrypt
+          print('PyMongo:', pymongo.version)
+          print('pymongocrypt:', getattr(pymongocrypt, '__version__', 'unknown'))
+          PY
+
+      - name: Download official MongoDB binary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output runtime/mongodb.tgz \
+            "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}.tgz"
+          tar -xzf runtime/mongodb.tgz -C runtime
+          MONGODB_HOME="$PWD/runtime/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}"
+          echo "$MONGODB_HOME/bin" >> "$GITHUB_PATH"
+          "$MONGODB_HOME/bin/mongod" --version | tee "$EVIDENCE_DIR/mongod-version.txt"
+          sha256sum runtime/mongodb.tgz | tee "$EVIDENCE_DIR/mongodb-archive-sha256.txt"
+
+      - name: Decode and verify PoC
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base64 -d security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py
+          base64 -d security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/setup_qe_topology.py
+          python -m py_compile security-research/mongodb-qe/*.py
+          sha256sum security-research/mongodb-qe/*.py | tee "$EVIDENCE_DIR/harness-sha256.txt"
+
+      - name: Start authenticated replica set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          RUNTIME="$PWD/runtime"
+          EVIDENCE_ABS="$PWD/$EVIDENCE_DIR"
+          mkdir -p "$RUNTIME/db" "$RUNTIME/logs" "$EVIDENCE_ABS"
+          openssl rand -base64 512 | tr -d '\n' > "$RUNTIME/keyfile"
+          chmod 400 "$RUNTIME/keyfile"
+          mongod \
+            --dbpath "$RUNTIME/db" \
+            --replSet rs0 \
+            --bind_ip 127.0.0.1 \
+            --port 27017 \
+            --keyFile "$RUNTIME/keyfile" \
+            --setParameter enableTestCommands=1 \
+            --pidfilepath "$RUNTIME/mongod.pid" \
+            --logpath "$RUNTIME/logs/mongod.log" \
+            --fork
+          python security-research/mongodb-qe/setup_qe_topology.py \
+            replica "$EVIDENCE_ABS/topology-setup.json" \
+            2>&1 | tee "$EVIDENCE_ABS/topology-setup-output.txt"
+
+      - name: Run strict authorization PoC
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          POC_TOPOLOGY="replica-${MONGODB_VERSION}" \
+          MONGODB_ADMIN_URI='mongodb://admin:admin@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' \
+          MONGODB_ATTACKER_URI='mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' \
+          POC_RESULT_PATH="$EVIDENCE_DIR/qe-result.json" \
+          POC_BASELINE_COMMAND_PATH="$EVIDENCE_DIR/baseline-post-libmongocrypt.json" \
+          POC_CRAFTED_COMMAND_PATH="$EVIDENCE_DIR/crafted-raw-replay.json" \
+          python security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py \
+            2>&1 | tee "$EVIDENCE_DIR/poc-output.txt"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$EVIDENCE_DIR/poc-exit-code.txt"
+          exit 0
+
+      - name: Collect evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cp runtime/logs/mongod.log "$EVIDENCE_DIR/" 2>/dev/null || true
+          python -m pip freeze > "$EVIDENCE_DIR/pip-freeze.txt"
+          uname -a > "$EVIDENCE_DIR/runner-uname.txt"
+          git rev-parse HEAD > "$EVIDENCE_DIR/harness-commit.txt"
+          find "$EVIDENCE_DIR" -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/SHA256SUMS.txt"
+          [[ -f runtime/mongod.pid ]] && kill "$(cat runtime/mongod.pid)" 2>/dev/null || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-${{ matrix.version }}-qe-authz-evidence
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce strict confirmation
+        if: always()
+        shell: bash
+        run: |
+          test -f "$EVIDENCE_DIR/poc-exit-code.txt"
+          test "$(cat "$EVIDENCE_DIR/poc-exit-code.txt")" = '0'
