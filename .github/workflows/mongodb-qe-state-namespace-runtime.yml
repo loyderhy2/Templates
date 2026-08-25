@@ -78,62 +78,76 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p runtime/logs runtime/db "$EVIDENCE_DIR"
-          openssl rand -base64 756 | tr -d '\n' | head -c 756 > runtime/keyfile
-          chmod 400 runtime/keyfile
+          RUNTIME="$PWD/runtime"
+          EVIDENCE_ABS="$PWD/$EVIDENCE_DIR"
+          mkdir -p "$RUNTIME/logs" "$RUNTIME/db" "$EVIDENCE_ABS"
+          openssl rand -base64 512 | tr -d '\n' > "$RUNTIME/keyfile"
+          chmod 400 "$RUNTIME/keyfile"
 
           if [[ "${{ matrix.topology }}" == "replica" ]]; then
-            mkdir -p runtime/db/rs0
+            mkdir -p "$RUNTIME/db/rs0"
             mongod \
-              --dbpath runtime/db/rs0 \
+              --dbpath "$RUNTIME/db/rs0" \
               --replSet rs0 \
               --bind_ip 127.0.0.1 \
               --port 27017 \
-              --keyFile runtime/keyfile \
+              --keyFile "$RUNTIME/keyfile" \
               --setParameter enableTestCommands=1 \
-              --pidfilepath runtime/rs0.pid \
-              --logpath runtime/logs/rs0.log \
+              --pidfilepath "$RUNTIME/rs0.pid" \
+              --logpath "$RUNTIME/logs/rs0.log" \
               --fork
             python security-research/mongodb-qe/setup_qe_topology.py \
-              replica "$EVIDENCE_DIR/topology-setup.json" \
-              2>&1 | tee "$EVIDENCE_DIR/topology-setup-output.txt"
+              replica "$EVIDENCE_ABS/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_ABS/topology-setup-output.txt"
             echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
             echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
           else
-            mkdir -p runtime/db/config runtime/db/shard
+            mkdir -p "$RUNTIME/db/config" "$RUNTIME/db/shard"
             mongod \
               --configsvr \
-              --dbpath runtime/db/config \
+              --dbpath "$RUNTIME/db/config" \
               --replSet configRS \
               --bind_ip 127.0.0.1 \
               --port 27019 \
-              --keyFile runtime/keyfile \
+              --keyFile "$RUNTIME/keyfile" \
               --setParameter enableTestCommands=1 \
-              --pidfilepath runtime/config.pid \
-              --logpath runtime/logs/config.log \
+              --pidfilepath "$RUNTIME/config.pid" \
+              --logpath "$RUNTIME/logs/config.log" \
               --fork
             mongod \
               --shardsvr \
-              --dbpath runtime/db/shard \
+              --dbpath "$RUNTIME/db/shard" \
               --replSet shardRS \
               --bind_ip 127.0.0.1 \
               --port 27018 \
-              --keyFile runtime/keyfile \
+              --keyFile "$RUNTIME/keyfile" \
               --setParameter enableTestCommands=1 \
-              --pidfilepath runtime/shard.pid \
-              --logpath runtime/logs/shard.log \
+              --pidfilepath "$RUNTIME/shard.pid" \
+              --logpath "$RUNTIME/logs/shard.log" \
               --fork
+            python - <<'PY' 2>&1 | tee "$EVIDENCE_ABS/pre-mongos-replset-init.txt"
+          import importlib.util
+          from pathlib import Path
+
+          path = Path('security-research/mongodb-qe/setup_qe_topology.py')
+          spec = importlib.util.spec_from_file_location('qe_setup', path)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+          print(module.initiate_replset(27019, 'configRS', configsvr=True))
+          print(module.initiate_replset(27018, 'shardRS'))
+          PY
             mongos \
               --configdb configRS/127.0.0.1:27019 \
               --bind_ip 127.0.0.1 \
               --port 27017 \
-              --keyFile runtime/keyfile \
-              --pidfilepath runtime/mongos.pid \
-              --logpath runtime/logs/mongos.log \
+              --keyFile "$RUNTIME/keyfile" \
+              --pidfilepath "$RUNTIME/mongos.pid" \
+              --logpath "$RUNTIME/logs/mongos.log" \
               --fork
             python security-research/mongodb-qe/setup_qe_topology.py \
-              mongos "$EVIDENCE_DIR/topology-setup.json" \
-              2>&1 | tee "$EVIDENCE_DIR/topology-setup-output.txt"
+              mongos "$EVIDENCE_ABS/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_ABS/topology-setup-output.txt"
             echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
             echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
           fi
@@ -169,7 +183,7 @@ jobs:
           date -u +%Y-%m-%dT%H:%M:%SZ > "$EVIDENCE_DIR/finished-at.txt"
           find "$EVIDENCE_DIR" -maxdepth 2 -type f ! -name SHA256SUMS.txt -print0 \
             | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/SHA256SUMS.txt"
-          for pidfile in runtime/*.pid; do
+          for pidfile in "$PWD"/runtime/*.pid; do
             [[ -f "$pidfile" ]] && kill "$(cat "$pidfile")" 2>/dev/null || true
           done
 
