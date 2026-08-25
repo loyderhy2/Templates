@@ -1,0 +1,41 @@
+name: Export decoded MongoDB QE harnesses
+
+on:
+  push:
+    branches:
+      - security/mongodb-qe-runtime-export2-20260825
+    paths:
+      - .github/workflows/mongodb-qe-export-decoded.yml
+      - security-research/mongodb-qe/**
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode exact harnesses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p decoded
+          tr -cd 'A-Za-z0-9+/=' < security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py.gz.b64 \
+            | base64 -d | gzip -d > decoded/qe_state_namespace_raw_replay_poc.py
+          tr -cd 'A-Za-z0-9+/=' < security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
+            | base64 -d | gzip -d > decoded/setup_qe_topology.py
+          chmod 700 decoded/*.py
+          python -m py_compile decoded/*.py
+          sha256sum decoded/*.py > decoded/SHA256SUMS.txt
+          git rev-parse HEAD > decoded/source-commit.txt
+
+      - name: Upload decoded harnesses
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-qe-decoded-harnesses
+          path: decoded
+          if-no-files-found: error
+          retention-days: 7
