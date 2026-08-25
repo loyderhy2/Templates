@@ -66,10 +66,12 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          base64 -d security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py.gz.b64 \
-            | gzip -d > security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py
-          base64 -d security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
-            | gzip -d > security-research/mongodb-qe/setup_qe_topology.py
+          tr -cd 'A-Za-z0-9+/=' < security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py.gz.b64 \
+            | base64 -d | gzip -d \
+            > security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py
+          tr -cd 'A-Za-z0-9+/=' < security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
+            | base64 -d | gzip -d \
+            > security-research/mongodb-qe/setup_qe_topology.py
           chmod 700 security-research/mongodb-qe/*.py
           python -m py_compile security-research/mongodb-qe/*.py
           sha256sum security-research/mongodb-qe/*.py | tee "$EVIDENCE_DIR/harness-sha256.txt"
