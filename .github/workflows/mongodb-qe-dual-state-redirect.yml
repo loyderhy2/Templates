@@ -1,0 +1,199 @@
+name: MongoDB QE dual state-namespace authorization runtime
+
+on:
+  push:
+    branches:
+      - security/mongodb-qe-runtime-20260825
+    paths:
+      - .github/workflows/mongodb-qe-dual-state-redirect.yml
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: MongoDB 8.3.8 / dual-state / ${{ matrix.topology }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [replica, mongos]
+    env:
+      MONGODB_VERSION: 8.3.8
+      EVIDENCE_DIR: security-research/mongodb-qe/dual-evidence/${{ matrix.topology }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install encryption dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install 'pymongo[encryption]==4.17.0'
+          mkdir -p "$EVIDENCE_DIR"
+          python - <<'PY' | tee "$EVIDENCE_DIR/python-dependencies.txt"
+          import pymongo, pymongocrypt
+          print('PyMongo:', pymongo.version)
+          print('pymongocrypt:', getattr(pymongocrypt, '__version__', 'unknown'))
+          PY
+
+      - name: Download official MongoDB 8.3.8
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output runtime/mongodb.tgz \
+            "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}.tgz"
+          tar -xzf runtime/mongodb.tgz -C runtime
+          MONGODB_HOME="$PWD/runtime/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}"
+          echo "$MONGODB_HOME/bin" >> "$GITHUB_PATH"
+          "$MONGODB_HOME/bin/mongod" --version | tee "$EVIDENCE_DIR/mongod-version.txt"
+          "$MONGODB_HOME/bin/mongos" --version | tee "$EVIDENCE_DIR/mongos-version.txt"
+          sha256sum runtime/mongodb.tgz | tee "$EVIDENCE_DIR/mongodb-archive-sha256.txt"
+
+      - name: Decode and verify harnesses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base64 -d security-research/mongodb-qe/qe_state_namespace_both_replay_poc.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/qe_state_namespace_both_replay_poc.py
+          base64 -d security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/setup_qe_topology.py
+          python -m py_compile \
+            security-research/mongodb-qe/qe_state_namespace_both_replay_poc.py \
+            security-research/mongodb-qe/setup_qe_topology.py
+          sha256sum \
+            security-research/mongodb-qe/qe_state_namespace_both_replay_poc.py \
+            security-research/mongodb-qe/setup_qe_topology.py \
+            | tee "$EVIDENCE_DIR/harness-sha256.txt"
+
+      - name: Start authenticated topology
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          RUNTIME="$PWD/runtime"
+          EVIDENCE_ABS="$PWD/$EVIDENCE_DIR"
+          mkdir -p "$RUNTIME/logs" "$RUNTIME/db" "$EVIDENCE_ABS"
+          openssl rand -base64 512 | tr -d '\n' > "$RUNTIME/keyfile"
+          chmod 400 "$RUNTIME/keyfile"
+
+          if [[ "${{ matrix.topology }}" == "replica" ]]; then
+            mkdir -p "$RUNTIME/db/rs0"
+            mongod \
+              --dbpath "$RUNTIME/db/rs0" \
+              --replSet rs0 \
+              --bind_ip 127.0.0.1 \
+              --port 27017 \
+              --keyFile "$RUNTIME/keyfile" \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath "$RUNTIME/rs0.pid" \
+              --logpath "$RUNTIME/logs/rs0.log" \
+              --fork
+            python security-research/mongodb-qe/setup_qe_topology.py \
+              replica "$EVIDENCE_ABS/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_ABS/topology-setup-output.txt"
+            echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
+            echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
+          else
+            mkdir -p "$RUNTIME/db/config" "$RUNTIME/db/shard"
+            mongod \
+              --configsvr \
+              --dbpath "$RUNTIME/db/config" \
+              --replSet configRS \
+              --bind_ip 127.0.0.1 \
+              --port 27019 \
+              --keyFile "$RUNTIME/keyfile" \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath "$RUNTIME/config.pid" \
+              --logpath "$RUNTIME/logs/config.log" \
+              --fork
+            mongod \
+              --shardsvr \
+              --dbpath "$RUNTIME/db/shard" \
+              --replSet shardRS \
+              --bind_ip 127.0.0.1 \
+              --port 27018 \
+              --keyFile "$RUNTIME/keyfile" \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath "$RUNTIME/shard.pid" \
+              --logpath "$RUNTIME/logs/shard.log" \
+              --fork
+            python - <<'PY' 2>&1 | tee "$EVIDENCE_ABS/pre-mongos-replset-init.txt"
+          import importlib.util
+          from pathlib import Path
+          path = Path('security-research/mongodb-qe/setup_qe_topology.py')
+          spec = importlib.util.spec_from_file_location('qe_setup', path)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+          print(module.initiate_replset(27019, 'configRS', configsvr=True))
+          print(module.initiate_replset(27018, 'shardRS'))
+          PY
+            mongos \
+              --configdb configRS/127.0.0.1:27019 \
+              --bind_ip 127.0.0.1 \
+              --port 27017 \
+              --keyFile "$RUNTIME/keyfile" \
+              --pidfilepath "$RUNTIME/mongos.pid" \
+              --logpath "$RUNTIME/logs/mongos.log" \
+              --fork
+            python security-research/mongodb-qe/setup_qe_topology.py \
+              mongos "$EVIDENCE_ABS/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_ABS/topology-setup-output.txt"
+            echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
+            echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
+          fi
+
+      - name: Run dual-state strict PoC
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          POC_TOPOLOGY='dual-${{ matrix.topology }}' \
+          MONGODB_ADMIN_URI="$ADMIN_URI" \
+          MONGODB_ATTACKER_URI="$ATTACKER_URI" \
+          POC_RESULT_PATH="$EVIDENCE_DIR/qe-dual-result.json" \
+          POC_BASELINE_COMMAND_PATH="$EVIDENCE_DIR/baseline-post-libmongocrypt.json" \
+          POC_CRAFTED_COMMAND_PATH="$EVIDENCE_DIR/crafted-dual-raw-replay.json" \
+          python security-research/mongodb-qe/qe_state_namespace_both_replay_poc.py \
+            2>&1 | tee "$EVIDENCE_DIR/poc-output.txt"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$EVIDENCE_DIR/poc-exit-code.txt"
+          exit 0
+
+      - name: Collect bounded evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$EVIDENCE_DIR/logs"
+          cp runtime/logs/*.log "$EVIDENCE_DIR/logs/" 2>/dev/null || true
+          python -m pip freeze > "$EVIDENCE_DIR/pip-freeze.txt"
+          uname -a > "$EVIDENCE_DIR/runner-uname.txt"
+          git rev-parse HEAD > "$EVIDENCE_DIR/harness-commit.txt"
+          find "$EVIDENCE_DIR" -maxdepth 2 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/SHA256SUMS.txt"
+          for pidfile in "$PWD"/runtime/*.pid; do
+            [[ -f "$pidfile" ]] && kill "$(cat "$pidfile")" 2>/dev/null || true
+          done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-8.3.8-qe-dual-${{ matrix.topology }}-evidence
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce strict confirmation
+        if: always()
+        shell: bash
+        run: |
+          test -f "$EVIDENCE_DIR/poc-exit-code.txt"
+          test "$(cat "$EVIDENCE_DIR/poc-exit-code.txt")" = '0'
