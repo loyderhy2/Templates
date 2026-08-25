@@ -1,0 +1,197 @@
+name: MongoDB QE state-namespace authorization runtime
+
+on:
+  push:
+    branches:
+      - security/mongodb-qe-runtime-20260825
+    paths:
+      - security-research/mongodb-qe/**
+      - .github/workflows/mongodb-qe-state-namespace-runtime.yml
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: MongoDB 8.3.8 / ${{ matrix.topology }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [replica, mongos]
+    env:
+      MONGODB_VERSION: 8.3.8
+      EVIDENCE_DIR: security-research/mongodb-qe/evidence/${{ matrix.topology }}
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyMongo encryption dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'pymongo[encryption]==4.17.0'
+          mkdir -p "$EVIDENCE_DIR"
+          python - <<'PY' | tee "$EVIDENCE_DIR/python-dependencies.txt"
+          import pymongo
+          import pymongocrypt
+          print('PyMongo:', pymongo.version)
+          print('pymongocrypt:', getattr(pymongocrypt, '__version__', 'unknown'))
+          PY
+
+      - name: Download MongoDB Community Server
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output runtime/mongodb.tgz \
+            "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}.tgz"
+          tar -xzf runtime/mongodb.tgz -C runtime
+          MONGODB_HOME="$PWD/runtime/mongodb-linux-x86_64-ubuntu2404-${MONGODB_VERSION}"
+          echo "MONGODB_HOME=$MONGODB_HOME" >> "$GITHUB_ENV"
+          echo "$MONGODB_HOME/bin" >> "$GITHUB_PATH"
+          "$MONGODB_HOME/bin/mongod" --version | tee "$EVIDENCE_DIR/mongod-version.txt"
+          "$MONGODB_HOME/bin/mongos" --version | tee "$EVIDENCE_DIR/mongos-version.txt"
+          sha256sum runtime/mongodb.tgz | tee "$EVIDENCE_DIR/mongodb-archive-sha256.txt"
+
+      - name: Decode and verify harnesses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base64 -d security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py
+          base64 -d security-research/mongodb-qe/setup_qe_topology.py.gz.b64 \
+            | gzip -d > security-research/mongodb-qe/setup_qe_topology.py
+          chmod 700 security-research/mongodb-qe/*.py
+          python -m py_compile security-research/mongodb-qe/*.py
+          sha256sum security-research/mongodb-qe/*.py | tee "$EVIDENCE_DIR/harness-sha256.txt"
+
+      - name: Start authenticated MongoDB topology
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime/logs runtime/db "$EVIDENCE_DIR"
+          openssl rand -base64 756 | tr -d '\n' | head -c 756 > runtime/keyfile
+          chmod 400 runtime/keyfile
+
+          if [[ "${{ matrix.topology }}" == "replica" ]]; then
+            mkdir -p runtime/db/rs0
+            mongod \
+              --dbpath runtime/db/rs0 \
+              --replSet rs0 \
+              --bind_ip 127.0.0.1 \
+              --port 27017 \
+              --keyFile runtime/keyfile \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath runtime/rs0.pid \
+              --logpath runtime/logs/rs0.log \
+              --fork
+            python security-research/mongodb-qe/setup_qe_topology.py \
+              replica "$EVIDENCE_DIR/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_DIR/topology-setup-output.txt"
+            echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
+            echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?replicaSet=rs0&authSource=admin' >> "$GITHUB_ENV"
+          else
+            mkdir -p runtime/db/config runtime/db/shard
+            mongod \
+              --configsvr \
+              --dbpath runtime/db/config \
+              --replSet configRS \
+              --bind_ip 127.0.0.1 \
+              --port 27019 \
+              --keyFile runtime/keyfile \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath runtime/config.pid \
+              --logpath runtime/logs/config.log \
+              --fork
+            mongod \
+              --shardsvr \
+              --dbpath runtime/db/shard \
+              --replSet shardRS \
+              --bind_ip 127.0.0.1 \
+              --port 27018 \
+              --keyFile runtime/keyfile \
+              --setParameter enableTestCommands=1 \
+              --pidfilepath runtime/shard.pid \
+              --logpath runtime/logs/shard.log \
+              --fork
+            mongos \
+              --configdb configRS/127.0.0.1:27019 \
+              --bind_ip 127.0.0.1 \
+              --port 27017 \
+              --keyFile runtime/keyfile \
+              --pidfilepath runtime/mongos.pid \
+              --logpath runtime/logs/mongos.log \
+              --fork
+            python security-research/mongodb-qe/setup_qe_topology.py \
+              mongos "$EVIDENCE_DIR/topology-setup.json" \
+              2>&1 | tee "$EVIDENCE_DIR/topology-setup-output.txt"
+            echo 'ADMIN_URI=mongodb://admin:admin@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
+            echo 'ATTACKER_URI=mongodb://qe_attacker:qe_attacker_password@127.0.0.1:27017/admin?authSource=admin' >> "$GITHUB_ENV"
+          fi
+
+      - name: Run control, baseline, mutation, and raw replay
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          POC_TOPOLOGY='${{ matrix.topology }}' \
+          MONGODB_ADMIN_URI="$ADMIN_URI" \
+          MONGODB_ATTACKER_URI="$ATTACKER_URI" \
+          POC_RESULT_PATH="$EVIDENCE_DIR/qe-result.json" \
+          POC_BASELINE_COMMAND_PATH="$EVIDENCE_DIR/baseline-post-libmongocrypt.json" \
+          POC_CRAFTED_COMMAND_PATH="$EVIDENCE_DIR/crafted-raw-replay.json" \
+          python security-research/mongodb-qe/qe_state_namespace_raw_replay_poc.py \
+            2>&1 | tee "$EVIDENCE_DIR/poc-output.txt"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$EVIDENCE_DIR/poc-exit-code.txt"
+          exit 0
+
+      - name: Collect bounded evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$EVIDENCE_DIR/logs"
+          cp runtime/logs/*.log "$EVIDENCE_DIR/logs/" 2>/dev/null || true
+          ps auxww > "$EVIDENCE_DIR/processes.txt"
+          python -m pip freeze > "$EVIDENCE_DIR/pip-freeze.txt" 2>/dev/null || true
+          uname -a > "$EVIDENCE_DIR/runner-uname.txt"
+          git rev-parse HEAD > "$EVIDENCE_DIR/harness-commit.txt"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$EVIDENCE_DIR/finished-at.txt"
+          find "$EVIDENCE_DIR" -maxdepth 2 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/SHA256SUMS.txt"
+          for pidfile in runtime/*.pid; do
+            [[ -f "$pidfile" ]] && kill "$(cat "$pidfile")" 2>/dev/null || true
+          done
+
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-8.3.8-qe-${{ matrix.topology }}-evidence
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce strict result
+        if: always()
+        shell: bash
+        run: |
+          if [[ ! -f "$EVIDENCE_DIR/poc-exit-code.txt" ]]; then
+            echo 'PoC did not run.' >&2
+            exit 3
+          fi
+          rc=$(cat "$EVIDENCE_DIR/poc-exit-code.txt")
+          if [[ "$rc" != "0" ]]; then
+            echo "Strict QE confirmation was not reached; PoC exit code: $rc" >&2
+            exit "$rc"
+          fi
