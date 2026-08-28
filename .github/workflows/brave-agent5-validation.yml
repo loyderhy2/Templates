@@ -38,14 +38,14 @@ jobs:
             https://github.com/brave/brave-browser/releases/download/v1.94.117/brave-browser-1.94.117-linux-amd64.zip
           echo '865ff352311c57ba4639b5198bc89e92a838a57bff44182e3b9bb3980913a84d  brave-browser-1.94.117-linux-amd64.zip' | sha256sum --check
           unzip -q brave-browser-1.94.117-linux-amd64.zip -d brave-dist
-          brave_path="$(find "$PWD/brave-dist" -type f -name brave-browser | head -n 1)"
+          brave_path="$(find "$PWD/brave-dist" -type f -name brave-browser ! -path '*/cron/*' | head -n 1)"
           test -n "$brave_path"
           chmod +x "$brave_path"
           echo "BRAVE_EXECUTABLE=$brave_path" >> "$GITHUB_ENV"
           printf '%s\n' "$brave_path" | tee artifacts/brave-executable.txt
           "$brave_path" --version | tee artifacts/brave-version.txt
           sha256sum brave-browser-1.94.117-linux-amd64.zip | tee artifacts/brave-package-sha256.txt
-          ldd "$brave_path" | tee artifacts/brave-ldd.txt
+          (ldd "$brave_path" || true) | tee artifacts/brave-ldd.txt
           uname -a | tee artifacts/uname.txt
           cat /etc/os-release | tee artifacts/os-release.txt
 
