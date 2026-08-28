@@ -1,0 +1,78 @@
+name: Publish Brave Agent 5 validation evidence
+
+on:
+  push:
+    paths:
+      - '.github/workflows/publish-brave-agent5-run-33157047196.yml'
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v4
+        with:
+          ref: security/brave-agent5-validation-20260828
+          fetch-depth: 0
+
+      - name: Wait for validation run and download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: '33157047196'
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 80); do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '.status')"
+            conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '.conclusion // ""')"
+            echo "validation status=${status} conclusion=${conclusion}"
+            if [[ "$status" == "completed" ]]; then
+              [[ "$conclusion" == "success" ]] || { echo "validation run failed: $conclusion"; exit 1; }
+              break
+            fi
+            sleep 15
+          done
+          [[ "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '.status')" == "completed" ]]
+          rm -rf brave-agent5-published/latest
+          mkdir -p brave-agent5-published/latest
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name brave-agent5-validation-1.94.117 --dir brave-agent5-published/latest
+
+      - name: Add provenance manifest
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('brave-agent5-published/latest')
+          entries = []
+          for p in sorted(root.rglob('*')):
+              if p.is_file():
+                  entries.append({
+                      'path': p.as_posix(),
+                      'size': p.stat().st_size,
+                      'sha256': hashlib.sha256(p.read_bytes()).hexdigest(),
+                  })
+          manifest = {
+              'source_validation_run_id': 33157047196,
+              'source_branch': 'security/brave-agent5-validation-20260828',
+              'source_probe_commit': '1096c872c4d256b32e34efdc62f440b190094750',
+              'generated_by_run_id': '${{ github.run_id }}',
+              'files': entries,
+          }
+          (root / 'PUBLISH_MANIFEST.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Commit evidence to validation branch
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add brave-agent5-published/latest
+          if git diff --cached --quiet; then
+            echo 'No evidence changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Publish Brave Agent 5 runtime evidence from run 33157047196'
+          git push origin HEAD:security/brave-agent5-validation-20260828
