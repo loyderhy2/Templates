@@ -30,17 +30,22 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts brave-dist
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb curl ca-certificates jq
+          sudo apt-get install -y --no-install-recommends xvfb curl ca-certificates jq unzip
           curl --fail --location --retry 4 --retry-delay 3 \
-            --output brave-browser_1.94.117_amd64.deb \
-            https://github.com/brave/brave-browser/releases/download/v1.94.117/brave-browser_1.94.117_amd64.deb
-          echo '640017e993594b4a201518c37e6c80a16a3835b5dc92cc0763b0267e1dec9324  brave-browser_1.94.117_amd64.deb' | sha256sum --check
-          sudo apt-get install -y ./brave-browser_1.94.117_amd64.deb
-          command -v brave-browser | tee artifacts/brave-executable.txt
-          brave-browser --version | tee artifacts/brave-version.txt
-          sha256sum brave-browser_1.94.117_amd64.deb | tee artifacts/brave-package-sha256.txt
+            --output brave-browser-1.94.117-linux-amd64.zip \
+            https://github.com/brave/brave-browser/releases/download/v1.94.117/brave-browser-1.94.117-linux-amd64.zip
+          echo '865ff352311c57ba4639b5198bc89e92a838a57bff44182e3b9bb3980913a84d  brave-browser-1.94.117-linux-amd64.zip' | sha256sum --check
+          unzip -q brave-browser-1.94.117-linux-amd64.zip -d brave-dist
+          brave_path="$(find "$PWD/brave-dist" -type f -name brave-browser | head -n 1)"
+          test -n "$brave_path"
+          chmod +x "$brave_path"
+          echo "BRAVE_EXECUTABLE=$brave_path" >> "$GITHUB_ENV"
+          printf '%s\n' "$brave_path" | tee artifacts/brave-executable.txt
+          "$brave_path" --version | tee artifacts/brave-version.txt
+          sha256sum brave-browser-1.94.117-linux-amd64.zip | tee artifacts/brave-package-sha256.txt
+          ldd "$brave_path" | tee artifacts/brave-ldd.txt
           uname -a | tee artifacts/uname.txt
           cat /etc/os-release | tee artifacts/os-release.txt
 
@@ -57,7 +62,6 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          BRAVE_EXECUTABLE: /usr/bin/brave-browser
           ARTIFACT_DIR: artifacts
         run: |
           set +e
