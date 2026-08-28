@@ -1,0 +1,2 @@
+BRAVE-A5 controlled benign retrieval benchmark anchor.
+No persistent action is requested or authorized.
