@@ -1,0 +1,93 @@
+name: Brave Agent 5 current-release validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - security/brave-agent5-validation-20260828
+    paths:
+      - brave-agent5/**
+      - .github/workflows/brave-agent5-validation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out isolated validation branch
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Xvfb and official Brave Release 1.94.117
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb curl ca-certificates jq
+          curl --fail --location --retry 4 --retry-delay 3 \
+            --output brave-browser_1.94.117_amd64.deb \
+            https://github.com/brave/brave-browser/releases/download/v1.94.117/brave-browser_1.94.117_amd64.deb
+          echo '640017e993594b4a201518c37e6c80a16a3835b5dc92cc0763b0267e1dec9324  brave-browser_1.94.117_amd64.deb' | sha256sum --check
+          sudo apt-get install -y ./brave-browser_1.94.117_amd64.deb
+          command -v brave-browser | tee artifacts/brave-executable.txt
+          brave-browser --version | tee artifacts/brave-version.txt
+          sha256sum brave-browser_1.94.117_amd64.deb | tee artifacts/brave-package-sha256.txt
+          uname -a | tee artifacts/uname.txt
+          cat /etc/os-release | tee artifacts/os-release.txt
+
+      - name: Install Playwright control library
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm install --no-save --ignore-scripts playwright-core@latest
+          node --version | tee artifacts/node-version.txt
+          npm list playwright-core | tee artifacts/playwright-version.txt
+
+      - name: Run low-rate production-path validation
+        id: probe
+        continue-on-error: true
+        shell: bash
+        env:
+          BRAVE_EXECUTABLE: /usr/bin/brave-browser
+          ARTIFACT_DIR: artifacts
+        run: |
+          set +e
+          xvfb-run -a --server-args='-screen 0 1440x1100x24' node brave-agent5/probe.mjs 2>&1 | tee artifacts/probe-console.txt
+          code=${PIPESTATUS[0]}
+          echo "$code" > artifacts/probe-exit-code.txt
+          exit "$code"
+
+      - name: Preserve exact test sources and calculate attachment hashes
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/test-sources
+          cp brave-agent5/payload.html artifacts/test-sources/
+          cp brave-agent5/benign.html artifacts/test-sources/
+          cp brave-agent5/probe.mjs artifacts/test-sources/
+          cp .github/workflows/brave-agent5-validation.yml artifacts/test-sources/
+          git rev-parse HEAD | tee artifacts/test-branch-commit.txt
+          git status --short | tee artifacts/git-status.txt
+          find artifacts -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > artifacts/SHA256SUMS.txt
+
+      - name: Upload evidence package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brave-agent5-validation-1.94.117
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
