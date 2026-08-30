@@ -28,7 +28,9 @@ jobs:
           root="$(find . -maxdepth 1 -type d -name 'mongodb-database-tools-*100.18.0' -print -quit)"
           test -n "$root"
           printf '%s\n' "$root" > binary-root.txt
-          "$root/bin/mongodump" --version | tee mongodump-version.txt
+          for tool in mongodump mongorestore mongoexport mongoimport mongofiles mongostat mongotop; do
+            "$root/bin/$tool" --version | tee "$tool-version.txt"
+          done
 
       - name: Run differential credential-disclosure matrix
         shell: bash
@@ -38,9 +40,9 @@ jobs:
           root="$(cat binary-root.txt)"
           mkdir -p evidence
           canary='MONGODB_SECRET_CANARY_7A91FD'
-          uri="mongodb://canary_user:${canary}@127.0.0.1:1/admin?directConnection=true&serverSelectionTimeoutMS=300&connectTimeoutMS=300"
+          uri="mongodb://canary_user:${canary}@127.0.0.1:1/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=300&connectTimeoutMS=300"
 
-          printf 'tool\turi_exit\turi_contains_secret\tseparate_exit\tseparate_contains_secret\n' > results.tsv
+          printf 'tool\turi_exit\turi_reached_connect\turi_contains_secret\tseparate_exit\tseparate_reached_connect\tseparate_contains_secret\n' > results.tsv
 
           run_one() {
             local tool="$1"
@@ -50,25 +52,33 @@ jobs:
             local uri_err="evidence/${tool}.uri.stderr"
             local separate_out="evidence/${tool}.separate.stdout"
             local separate_err="evidence/${tool}.separate.stderr"
-            local uri_rc separate_rc uri_hit separate_hit
+            local uri_rc separate_rc uri_hit separate_hit uri_connect separate_connect
 
             set +e
-            timeout 12s "$root/bin/$tool" --uri="$uri" "${operation_args[@]}" >"$uri_out" 2>"$uri_err"
+            timeout 8s "$root/bin/$tool" \
+              --uri="$uri" \
+              --serverSelectionTimeout=1 \
+              --dialTimeout=1 \
+              "${operation_args[@]}" >"$uri_out" 2>"$uri_err"
             uri_rc=$?
-            timeout 12s "$root/bin/$tool" \
+            timeout 8s "$root/bin/$tool" \
               --host='127.0.0.1:1' \
               --username='canary_user' \
               --password="$canary" \
               --authenticationDatabase='admin' \
-              --serverSelectionTimeoutMS=300 \
+              --serverSelectionTimeout=1 \
+              --dialTimeout=1 \
               "${operation_args[@]}" >"$separate_out" 2>"$separate_err"
             separate_rc=$?
             set -e
 
             if grep -R -F -q -- "$canary" "$uri_out" "$uri_err"; then uri_hit=yes; else uri_hit=no; fi
             if grep -R -F -q -- "$canary" "$separate_out" "$separate_err"; then separate_hit=yes; else separate_hit=no; fi
+            if grep -E -q 'failed to connect|server selection error|connection refused|connect: connection refused|no reachable servers' "$uri_out" "$uri_err"; then uri_connect=yes; else uri_connect=no; fi
+            if grep -E -q 'failed to connect|server selection error|connection refused|connect: connection refused|no reachable servers' "$separate_out" "$separate_err"; then separate_connect=yes; else separate_connect=no; fi
 
-            printf '%s\t%s\t%s\t%s\t%s\n' "$tool" "$uri_rc" "$uri_hit" "$separate_rc" "$separate_hit" | tee -a results.tsv
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$tool" "$uri_rc" "$uri_connect" "$uri_hit" "$separate_rc" "$separate_connect" "$separate_hit" | tee -a results.tsv
           }
 
           mkdir -p empty_restore
@@ -77,7 +87,7 @@ jobs:
           run_one mongodump --db=agent6 --collection=probe --archive=dump.archive
           run_one mongorestore --nsInclude=agent6.probe empty_restore
           run_one mongoexport --db=agent6 --collection=probe --type=json --out=export.json
-          run_one mongoimport --db=agent6 --collection=probe --file=import.json --jsonArray=false
+          run_one mongoimport --db=agent6 --collection=probe --file=import.json
           run_one mongofiles --db=agent6 list
           run_one mongostat --rowcount=1 1
           run_one mongotop --rowcount=1 1
@@ -91,23 +101,36 @@ jobs:
               echo "--- $f"
               sed "s/${canary}/<CANARY_SECRET>/g" "$f"
             done
+            echo
+            echo '=== SEPARATE-PASSWORD STDERR, CANARY REDACTED FOR LOG DISPLAY ==='
+            for f in evidence/*.separate.stderr; do
+              echo "--- $f"
+              sed "s/${canary}/<CANARY_SECRET>/g" "$f"
+            done
           } | tee validation-summary.txt
 
-          if awk -F '\t' 'NR > 1 && $3 == "yes" {found=1} END {exit !found}' results.tsv; then
+          if awk -F '\t' 'NR > 1 && $4 == "yes" {found=1} END {exit !found}' results.tsv; then
             echo 'AT_LEAST_ONE_URI_SECRET_DISCLOSURE_CONFIRMED' | tee verdict.txt
           else
             echo 'NO_URI_SECRET_DISCLOSURE_OBSERVED' | tee verdict.txt
           fi
 
+          if awk -F '\t' 'NR > 1 && $3 != "yes" {bad=1} END {exit bad}' results.tsv; then
+            echo 'ALL_URI_CASES_REACHED_CONNECTION_FAILURE' | tee reachability.txt
+          else
+            echo 'SOME_URI_CASES_DID_NOT_REACH_CONNECTION_FAILURE' | tee reachability.txt
+          fi
+
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: mongodb-agent6-uri-redaction-100.18.0
+          name: mongodb-agent6-uri-redaction-100.18.0-run2
           path: |
             mongodb-agent6/runtime/results.tsv
             mongodb-agent6/runtime/verdict.txt
+            mongodb-agent6/runtime/reachability.txt
             mongodb-agent6/runtime/validation-summary.txt
-            mongodb-agent6/runtime/mongodump-version.txt
+            mongodb-agent6/runtime/*-version.txt
             mongodb-agent6/runtime/official-archive.sha256
             mongodb-agent6/runtime/evidence/
           if-no-files-found: error
