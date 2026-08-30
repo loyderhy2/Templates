@@ -1,0 +1,126 @@
+name: MongoDB Agent 6 config URI credential redaction
+
+on:
+  push:
+    branches:
+      - mongodb-agent6-uri-redaction-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  config-uri-redaction:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official MongoDB Database Tools 100.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mongodb-agent6-config
+          cd mongodb-agent6-config
+          curl --retry 3 --retry-all-errors --fail --silent --show-error --location \
+            'https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.18.0.tgz' \
+            -o tools.tgz
+          sha256sum tools.tgz | tee official-archive.sha256
+          tar -xzf tools.tgz
+          root="$(find . -maxdepth 1 -type d -name 'mongodb-database-tools-*100.18.0' -print -quit)"
+          printf '%s\n' "$root" > binary-root.txt
+          "$root/bin/mongodump" --version | tee mongodump-version.txt
+
+      - name: Compare inline URI, config URI, and config password
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mongodb-agent6-config
+          root="$(cat binary-root.txt)"
+          mkdir -p evidence
+
+          config_uri_canary='MONGODB_CONFIG_URI_CANARY_91A7'
+          config_password_canary='MONGODB_CONFIG_PASSWORD_CANARY_28BC'
+          encoded_uri_canary='MONGODB%5FENCODED%5FURI%5FCANARY%5F4D52'
+
+          cat > config-uri.yml <<EOF
+          uri: "mongodb://canary_user:${config_uri_canary}@127.0.0.1:1/?authSource=admin&directConnection=true"
+          EOF
+
+          cat > config-password.yml <<EOF
+          uri: "mongodb://canary_user@127.0.0.1:1/?authSource=admin&directConnection=true"
+          password: "${config_password_canary}"
+          EOF
+
+          set +e
+          timeout 8s "$root/bin/mongodump" \
+            --config=config-uri.yml --serverSelectionTimeout=1 --dialTimeout=1 \
+            --db=agent6 --collection=probe --archive=config-uri.archive \
+            >evidence/config-uri.stdout 2>evidence/config-uri.stderr
+          config_uri_rc=$?
+
+          timeout 8s "$root/bin/mongodump" \
+            --config=config-password.yml --serverSelectionTimeout=1 --dialTimeout=1 \
+            --db=agent6 --collection=probe --archive=config-password.archive \
+            >evidence/config-password.stdout 2>evidence/config-password.stderr
+          config_password_rc=$?
+
+          timeout 8s "$root/bin/mongodump" \
+            --uri="mongodb://canary_user:${encoded_uri_canary}@127.0.0.1:1/?authSource=admin&directConnection=true" \
+            --serverSelectionTimeout=1 --dialTimeout=1 \
+            --db=agent6 --collection=probe --archive=encoded-uri.archive \
+            >evidence/encoded-uri.stdout 2>evidence/encoded-uri.stderr
+          encoded_uri_rc=$?
+          set -e
+
+          contains() {
+            local needle="$1"; shift
+            if grep -F -q -- "$needle" "$@"; then printf yes; else printf no; fi
+          }
+          reached() {
+            if grep -E -q 'failed to connect|server selection error|connection refused' "$@"; then printf yes; else printf no; fi
+          }
+
+          {
+            printf 'case\texit\treached_connect\tsecret_in_output\n'
+            printf 'config-uri\t%s\t%s\t%s\n' "$config_uri_rc" \
+              "$(reached evidence/config-uri.stdout evidence/config-uri.stderr)" \
+              "$(contains "$config_uri_canary" evidence/config-uri.stdout evidence/config-uri.stderr)"
+            printf 'config-password\t%s\t%s\t%s\n' "$config_password_rc" \
+              "$(reached evidence/config-password.stdout evidence/config-password.stderr)" \
+              "$(contains "$config_password_canary" evidence/config-password.stdout evidence/config-password.stderr)"
+            printf 'encoded-inline-uri\t%s\t%s\t%s\n' "$encoded_uri_rc" \
+              "$(reached evidence/encoded-uri.stdout evidence/encoded-uri.stderr)" \
+              "$(contains "$encoded_uri_canary" evidence/encoded-uri.stdout evidence/encoded-uri.stderr)"
+          } | tee results.tsv
+
+          {
+            echo '=== CONFIG URI STDERR (CANARY REDACTED FOR DISPLAY) ==='
+            sed "s/${config_uri_canary}/<CONFIG_URI_CANARY>/g" evidence/config-uri.stderr
+            echo
+            echo '=== CONFIG PASSWORD STDERR (CANARY REDACTED FOR DISPLAY) ==='
+            sed "s/${config_password_canary}/<CONFIG_PASSWORD_CANARY>/g" evidence/config-password.stderr
+            echo
+            echo '=== ENCODED INLINE URI STDERR (CANARY REDACTED FOR DISPLAY) ==='
+            sed "s/${encoded_uri_canary}/<ENCODED_URI_CANARY>/g" evidence/encoded-uri.stderr
+          } | tee validation-summary.txt
+
+          awk -F '\t' '
+            NR == 2 { if ($3 != "yes" || $4 != "yes") exit 1 }
+            NR == 3 { if ($3 != "yes" || $4 != "no") exit 1 }
+            NR == 4 { if ($3 != "yes" || $4 != "yes") exit 1 }
+          ' results.tsv
+          echo 'CONFIG_AND_ENCODED_URI_DISCLOSURE_CONFIRMED_WITH_NEGATIVE_CONTROL' | tee verdict.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-agent6-config-uri-redaction-100.18.0
+          path: |
+            mongodb-agent6-config/results.tsv
+            mongodb-agent6-config/verdict.txt
+            mongodb-agent6-config/validation-summary.txt
+            mongodb-agent6-config/mongodump-version.txt
+            mongodb-agent6-config/official-archive.sha256
+            mongodb-agent6-config/evidence/
+          if-no-files-found: error
+          retention-days: 7
