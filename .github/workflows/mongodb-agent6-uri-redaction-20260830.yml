@@ -40,7 +40,7 @@ jobs:
           root="$(cat binary-root.txt)"
           mkdir -p evidence
           canary='MONGODB_SECRET_CANARY_7A91FD'
-          uri="mongodb://canary_user:${canary}@127.0.0.1:1/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=300&connectTimeoutMS=300"
+          uri="mongodb://canary_user:${canary}@127.0.0.1:1/?authSource=admin&directConnection=true"
 
           printf 'tool\turi_exit\turi_reached_connect\turi_contains_secret\tseparate_exit\tseparate_reached_connect\tseparate_contains_secret\n' > results.tsv
 
@@ -124,7 +124,7 @@ jobs:
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: mongodb-agent6-uri-redaction-100.18.0-run2
+          name: mongodb-agent6-uri-redaction-100.18.0-run3
           path: |
             mongodb-agent6/runtime/results.tsv
             mongodb-agent6/runtime/verdict.txt
