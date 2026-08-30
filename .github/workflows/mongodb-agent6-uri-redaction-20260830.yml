@@ -1,0 +1,114 @@
+name: MongoDB Agent 6 URI credential redaction
+
+on:
+  push:
+    branches:
+      - mongodb-agent6-uri-redaction-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  uri-redaction:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official MongoDB Database Tools 100.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mongodb-agent6/runtime
+          cd mongodb-agent6/runtime
+          url='https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.18.0.tgz'
+          curl --retry 3 --retry-all-errors --fail --silent --show-error --location "$url" -o tools.tgz
+          sha256sum tools.tgz | tee official-archive.sha256
+          tar -xzf tools.tgz
+          root="$(find . -maxdepth 1 -type d -name 'mongodb-database-tools-*100.18.0' -print -quit)"
+          test -n "$root"
+          printf '%s\n' "$root" > binary-root.txt
+          "$root/bin/mongodump" --version | tee mongodump-version.txt
+
+      - name: Run differential credential-disclosure matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mongodb-agent6/runtime
+          root="$(cat binary-root.txt)"
+          mkdir -p evidence
+          canary='MONGODB_SECRET_CANARY_7A91FD'
+          uri="mongodb://canary_user:${canary}@127.0.0.1:1/admin?directConnection=true&serverSelectionTimeoutMS=300&connectTimeoutMS=300"
+
+          printf 'tool\turi_exit\turi_contains_secret\tseparate_exit\tseparate_contains_secret\n' > results.tsv
+
+          run_one() {
+            local tool="$1"
+            shift
+            local -a operation_args=("$@")
+            local uri_out="evidence/${tool}.uri.stdout"
+            local uri_err="evidence/${tool}.uri.stderr"
+            local separate_out="evidence/${tool}.separate.stdout"
+            local separate_err="evidence/${tool}.separate.stderr"
+            local uri_rc separate_rc uri_hit separate_hit
+
+            set +e
+            timeout 12s "$root/bin/$tool" --uri="$uri" "${operation_args[@]}" >"$uri_out" 2>"$uri_err"
+            uri_rc=$?
+            timeout 12s "$root/bin/$tool" \
+              --host='127.0.0.1:1' \
+              --username='canary_user' \
+              --password="$canary" \
+              --authenticationDatabase='admin' \
+              --serverSelectionTimeoutMS=300 \
+              "${operation_args[@]}" >"$separate_out" 2>"$separate_err"
+            separate_rc=$?
+            set -e
+
+            if grep -R -F -q -- "$canary" "$uri_out" "$uri_err"; then uri_hit=yes; else uri_hit=no; fi
+            if grep -R -F -q -- "$canary" "$separate_out" "$separate_err"; then separate_hit=yes; else separate_hit=no; fi
+
+            printf '%s\t%s\t%s\t%s\t%s\n' "$tool" "$uri_rc" "$uri_hit" "$separate_rc" "$separate_hit" | tee -a results.tsv
+          }
+
+          mkdir -p empty_restore
+          printf '{"_id":1}\n' > import.json
+
+          run_one mongodump --db=agent6 --collection=probe --archive=dump.archive
+          run_one mongorestore --nsInclude=agent6.probe empty_restore
+          run_one mongoexport --db=agent6 --collection=probe --type=json --out=export.json
+          run_one mongoimport --db=agent6 --collection=probe --file=import.json --jsonArray=false
+          run_one mongofiles --db=agent6 list
+          run_one mongostat --rowcount=1 1
+          run_one mongotop --rowcount=1 1
+
+          {
+            echo '=== RESULTS ==='
+            cat results.tsv
+            echo
+            echo '=== URI STDERR, CANARY REDACTED FOR LOG DISPLAY ==='
+            for f in evidence/*.uri.stderr; do
+              echo "--- $f"
+              sed "s/${canary}/<CANARY_SECRET>/g" "$f"
+            done
+          } | tee validation-summary.txt
+
+          if awk -F '\t' 'NR > 1 && $3 == "yes" {found=1} END {exit !found}' results.tsv; then
+            echo 'AT_LEAST_ONE_URI_SECRET_DISCLOSURE_CONFIRMED' | tee verdict.txt
+          else
+            echo 'NO_URI_SECRET_DISCLOSURE_OBSERVED' | tee verdict.txt
+          fi
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-agent6-uri-redaction-100.18.0
+          path: |
+            mongodb-agent6/runtime/results.tsv
+            mongodb-agent6/runtime/verdict.txt
+            mongodb-agent6/runtime/validation-summary.txt
+            mongodb-agent6/runtime/mongodump-version.txt
+            mongodb-agent6/runtime/official-archive.sha256
+            mongodb-agent6/runtime/evidence/
+          if-no-files-found: error
+          retention-days: 7
