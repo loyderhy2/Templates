@@ -60,12 +60,8 @@ jobs:
           ssh-keygen -q -t ed25519 -N '' -C 'agent6-attacker' -f evidence/runtime/keys/attacker_ed25519
           pub="$(cat evidence/runtime/keys/attacker_ed25519.pub)"
           printf '%s\n' "$pub" | tee evidence/runtime/attacker-public-key.txt
+          payload_json="$(python3 -c 'import json,sys; print(json.dumps("\n" + sys.argv[1] + "\n"))' "$pub")"
 
-          payload_json="$(python3 - "$pub" <<'PY'
-import json, sys
-print(json.dumps('\n' + sys.argv[1] + '\n'))
-PY
-)"
           docker exec agent6-mongo mongosh --quiet --eval "
             db = db.getSiblingDB('agent6');
             db.probe.drop();
