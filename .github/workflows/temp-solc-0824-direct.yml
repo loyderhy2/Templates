@@ -1,0 +1,38 @@
+name: Temporary direct solc 0.8.24 bundle
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .ci-trigger-solc-0824-direct
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch official static compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            'https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.24+commit.e11b9ed9' \
+            --output solc-0.8.24
+          chmod +x solc-0.8.24
+          ./solc-0.8.24 --version | tee solc-version.txt
+          sha256sum solc-0.8.24 | tee solc-0.8.24.sha256
+
+      - name: Upload compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: solc-0.8.24-static-linux
+          path: |
+            solc-0.8.24
+            solc-0.8.24.sha256
+            solc-version.txt
+          if-no-files-found: error
+          retention-days: 1
